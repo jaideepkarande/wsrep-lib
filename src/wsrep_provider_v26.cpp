@@ -808,6 +808,16 @@ wsrep::seqno wsrep::wsrep_provider_v26::pause()
     return wsrep::seqno(wsrep_->pause(wsrep_));
 }
 
+wsrep::seqno wsrep::wsrep_provider_v26::try_pause()
+{
+    /* PXC extension: provider may support non-blocking pause. */
+    if (wsrep_->try_pause)
+    {
+        return wsrep::seqno(wsrep_->try_pause(wsrep_));
+    }
+    return wsrep::seqno::undefined();
+}
+
 int wsrep::wsrep_provider_v26::resume()
 {
     return (wsrep_->resume(wsrep_) != WSREP_OK);
