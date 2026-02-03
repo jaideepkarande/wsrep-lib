@@ -324,6 +324,14 @@ namespace wsrep
         virtual int resync() = 0;
 
         virtual wsrep::seqno pause() = 0;
+        /**
+         * Try to pause writeset applying/committing without blocking.
+         *
+         * @return pause seqno on success, undefined seqno on failure or if
+         *         pausing would block (e.g. provider has unapplied/uncommitted
+         *         transactions that cannot drain right now).
+         */
+        virtual wsrep::seqno try_pause() = 0;
         virtual int resume() = 0;
 
         // Applier interface

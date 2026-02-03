@@ -48,6 +48,7 @@ namespace wsrep
         int desync() WSREP_OVERRIDE;
         int resync() WSREP_OVERRIDE;
         wsrep::seqno pause() WSREP_OVERRIDE;
+        wsrep::seqno try_pause() WSREP_OVERRIDE;
         int resume() WSREP_OVERRIDE;
 
         enum wsrep::provider::status

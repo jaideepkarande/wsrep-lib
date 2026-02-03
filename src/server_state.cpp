@@ -636,6 +636,82 @@ wsrep::seqno wsrep::server_state::desync_and_pause()
     return ret;
 }
 
+/*
+  In try_desync_and_pause function instead of calling
+  server_state::pause/try_pause we have merged 2 functions into one and added
+  pause pre-check first followed by desynch and actual try_pause.
+  So desync_and_pause and try_desync_and_pause functions are same just that
+  in try_desync_and_pause we call try_pause instead of pause and
+  handle the case when try_pause returns state where the pausing would block.
+  In that case we roll back the desync(refer pause, resume and
+  resume_and_resync function) and return undefined seqno to indicate failure.
+  If try_pause is successful then we return the pause seqno as before.
+*/
+wsrep::seqno wsrep::server_state::try_desync_and_pause()
+{
+    wsrep::log_info() << "Attempting to desync and pause the provider (non-blocking)";
+
+    wsrep::unique_lock<wsrep::mutex> lock(mutex_);
+
+    if (!pause_seqno_.is_undefined())
+    {
+        wsrep::log_info() << "Provider already paused at: " << pause_seqno_;
+        return pause_seqno_;
+    }
+
+    if (state(lock) != s_synced)
+    {
+        wsrep::log_info() << "Cannot pause: server not in synced state";
+        return wsrep::seqno::undefined();
+    }
+
+    while (pause_count_ > 0)
+    {
+        cond_.wait(lock);
+        if (!pause_seqno_.is_undefined())
+        {
+            wsrep::log_info() << "Provider already paused at: " << pause_seqno_;
+            return pause_seqno_;
+        }
+    }
+
+    ++pause_count_;
+    assert(pause_seqno_.is_undefined());
+    lock.unlock();
+
+    // Desync may fail transiently; tolerate if we can pause.
+    bool const desync_successful(desync() == 0);
+    if (!desync_successful)
+    {
+        WSREP_LOG_DEBUG(wsrep::log::debug_log_level(),
+                        wsrep::log::debug_level_server_state,
+                        "Failed to desync server before try_pause");
+    }
+
+    wsrep::seqno ret(provider().try_pause());
+
+    lock.lock();
+    if (ret.get() < 0)
+    {
+        --pause_count_;
+        cond_.notify_all(); // Not sure this is needed since we never paused.
+        lock.unlock();
+
+        if (desync_successful)
+        {
+            resync();
+        }
+        return wsrep::seqno::undefined();
+    }
+
+    pause_seqno_ = ret;
+    desynced_on_pause_ = desync_successful;
+    lock.unlock();
+
+    wsrep::log_info() << "Provider paused at: " << ret;
+    return ret;
+}
+
 void wsrep::server_state::resume_and_resync()
 {
     wsrep::log_info() << "Resuming and resyncing the provider";
