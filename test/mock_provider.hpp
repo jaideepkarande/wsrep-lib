@@ -26,6 +26,7 @@
 #include "wsrep/high_priority_service.hpp"
 
 #include <cstring>
+#include <functional>
 #include <map>
 #include <iostream> // todo: proper logging
 
@@ -45,6 +46,13 @@ namespace wsrep
             , commit_order_leave_result_()
             , release_result_()
             , replay_result_()
+            , connect_hook_()
+            , disconnect_hook_()
+            , sst_sent_hook_()
+            , destructor_hook_()
+            , connect_calls_()
+            , disconnect_calls_()
+            , sst_sent_calls_()
             , group_id_("1")
             , server_id_("1")
             , group_seqno_(0)
@@ -58,15 +66,31 @@ namespace wsrep
             , toi_commit_()
         { }
 
+        ~mock_provider()
+        {
+            if (destructor_hook_) destructor_hook_();
+        }
+
         enum wsrep::provider::status
         connect(const std::string&, const std::string&, const std::string&,
                 bool) WSREP_OVERRIDE
-        { return wsrep::provider::success; }
-        int disconnect() WSREP_OVERRIDE { return 0; }
+        {
+            ++connect_calls_;
+            if (connect_hook_) connect_hook_();
+            return wsrep::provider::success;
+        }
+        int disconnect() WSREP_OVERRIDE
+        {
+            ++disconnect_calls_;
+            if (disconnect_hook_) disconnect_hook_();
+            return 0;
+        }
         int capabilities() const WSREP_OVERRIDE { return 0; }
         int desync() WSREP_OVERRIDE { return 0; }
         int resync() WSREP_OVERRIDE { return 0; }
         wsrep::seqno pause() WSREP_OVERRIDE { return wsrep::seqno(0); }
+        wsrep::seqno try_desync_and_pause() WSREP_OVERRIDE
+        { return wsrep::seqno(0); }
         int resume() WSREP_OVERRIDE { return 0; }
         enum wsrep::provider::status run_applier(wsrep::high_priority_service*)
             WSREP_OVERRIDE
@@ -274,7 +298,11 @@ namespace wsrep
         { return wsrep::gtid(); }
         enum wsrep::provider::status sst_sent(const wsrep::gtid&, int)
             WSREP_OVERRIDE
-        { return wsrep::provider::success; }
+        {
+            ++sst_sent_calls_;
+            if (sst_sent_hook_) sst_sent_hook_();
+            return wsrep::provider::success;
+        }
         enum wsrep::provider::status sst_received(const wsrep::gtid&, int)
             WSREP_OVERRIDE
         { return wsrep::provider::success; }
@@ -344,6 +372,17 @@ namespace wsrep
         size_t toi_write_sets() const { return toi_write_sets_; }
         size_t toi_start_transaction() const { return toi_start_transaction_; }
         size_t toi_commit() const { return toi_commit_; }
+
+        // Hooks called from inside the corresponding provider calls, to let
+        // tests interleave other operations with them.
+        std::function<void()> connect_hook_;
+        std::function<void()> disconnect_hook_;
+        std::function<void()> sst_sent_hook_;
+        std::function<void()> destructor_hook_;
+        // Number of calls of the corresponding methods.
+        size_t connect_calls_;
+        size_t disconnect_calls_;
+        size_t sst_sent_calls_;
     private:
         wsrep::id group_id_;
         wsrep::id server_id_;

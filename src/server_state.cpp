@@ -536,7 +536,14 @@ void wsrep::server_state::set_provider_factory(
 
 void wsrep::server_state::unload_provider()
 {
-    provider_.reset();
+    std::unique_ptr<wsrep::provider> provider;
+    {
+        wsrep::unique_lock<wsrep::mutex> lock(mutex_);
+        wait_sst_sent_done(lock);
+        provider = std::move(provider_);
+    }
+    // The provider is destroyed without holding the mutex: its destructor
+    // may wait for callbacks which lock it.
 }
 
 int wsrep::server_state::connect(const std::string& cluster_name,
@@ -545,6 +552,12 @@ int wsrep::server_state::connect(const std::string& cluster_name,
                                    bool bootstrap)
 {
     bootstrap_ = is_bootstrap(cluster_address, bootstrap);
+    {
+        // sst_sent() of the previous connection may still be inside the
+        // provider if the provider closed the connection by itself.
+        wsrep::unique_lock<wsrep::mutex> lock(mutex_);
+        wait_sst_sent_done(lock);
+    }
     wsrep::log_info() << "Connecting with bootstrap option: " << bootstrap_;
     return provider().connect(cluster_name, cluster_address, state_donor,
                               bootstrap_);
@@ -564,7 +577,19 @@ int wsrep::server_state::disconnect()
             return 0;
         }
         state(lock, s_disconnecting);
+        if (sst_donation_ == sst_donation_active)
+        {
+            sst_donation_ = sst_donation_cancelled;
+        }
         interrupt_state_waiters(lock);
+        // Let sst_sent() already inside the provider complete before the
+        // connection is closed.
+        if (sst_donation_ == sst_donation_sending)
+        {
+            wsrep::log_info()
+                << "Waiting for sst_sent() to complete before disconnecting";
+            wait_sst_sent_done(lock);
+        }
     }
     return provider().disconnect();
 }
@@ -762,7 +787,16 @@ int wsrep::server_state::start_sst(const std::string& sst_request,
                                    bool bypass)
 {
     wsrep::unique_lock<wsrep::mutex> lock(mutex_);
+    // sst_sent() of the previous donation may still be returning from
+    // the provider.
+    wait_sst_sent_done(lock);
     state(lock, s_donor);
+    // state() may release the mutex while waiting for state waiters.
+    wait_sst_sent_done(lock);
+    // The state does not change while disconnecting: the end of this
+    // donation must not be reported to the provider.
+    sst_donation_ = (state_ == s_donor ? sst_donation_active
+                                       : sst_donation_cancelled);
     int ret(0);
     lock.unlock();
     if (server_service_.start_sst(sst_request, gtid, bypass))
@@ -770,6 +804,11 @@ int wsrep::server_state::start_sst(const std::string& sst_request,
         lock.lock();
         wsrep::log_warning() << "SST preparation failed";
         return_from_donor_state(lock);
+        // The provider ends the failed donation by itself.
+        if (sst_donation_ == sst_donation_active)
+        {
+            sst_donation_ = sst_donation_cancelled;
+        }
         ret = 1;
     }
     return ret;
@@ -784,10 +823,30 @@ void wsrep::server_state::sst_sent(const wsrep::gtid& gtid, int error)
 
     wsrep::unique_lock<wsrep::mutex> lock(mutex_);
 
-    return_from_donor_state(lock);
+    // The connection on which the donation started has ended (disconnect
+    // in progress or done): the provider has nothing to receive the end of
+    // the SST, and the server state belongs to the new connection, if any.
+    // Limitation: if a donation outlives a reconnect and the node becomes
+    // donor again, its late sst_sent() is taken for the new donation.
+    if (sst_donation_ != sst_donation_active || !provider_)
+    {
+        wsrep::log_info() << "SST donation is no longer current (the "
+                          << "connection to the cluster has ended), not "
+                          << "reporting the end of the SST to the provider";
+        if (sst_donation_ == sst_donation_cancelled)
+        {
+            sst_donation_ = sst_donation_none;
+        }
+        return;
+    }
 
+    return_from_donor_state(lock);
+    sst_donation_ = sst_donation_sending;
     lock.unlock();
     enum provider::status const retval(provider().sst_sent(gtid, error));
+    lock.lock();
+    sst_sent_done(lock);
+    lock.unlock();
     if (retval != provider::success)
     {
         std::string msg("wsrep::sst_sent() returned an error: ");
@@ -1126,6 +1185,10 @@ void wsrep::server_state::go_final(wsrep::unique_lock<wsrep::mutex>& lock,
         close_transactions_at_disconnect(*hps);
     }
     state(lock, s_disconnected);
+    if (sst_donation_ == sst_donation_active)
+    {
+        sst_donation_ = sst_donation_cancelled;
+    }
     id_ = wsrep::id::undefined();
 }
 
@@ -1771,5 +1834,24 @@ void wsrep::server_state::return_from_donor_state(
     if (state(lock) == s_donor)
     {
         state(lock, s_joined);
+    }
+}
+
+void wsrep::server_state::sst_sent_done(
+    wsrep::unique_lock<wsrep::mutex>& lock)
+{
+    assert(lock.owns_lock());
+    assert(sst_donation_ == sst_donation_sending);
+    sst_donation_ = sst_donation_none;
+    cond_.notify_all();
+}
+
+void wsrep::server_state::wait_sst_sent_done(
+    wsrep::unique_lock<wsrep::mutex>& lock)
+{
+    assert(lock.owns_lock());
+    while (sst_donation_ == sst_donation_sending)
+    {
+        cond_.wait(lock);
     }
 }

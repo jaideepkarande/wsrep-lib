@@ -21,6 +21,12 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 namespace
 {
     struct server_fixture_base
@@ -599,6 +605,7 @@ BOOST_FIXTURE_TEST_CASE(
     BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
     ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
     BOOST_REQUIRE(ss.state() == wsrep::server_state::s_joined);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 1);
     ss.on_sync();
     BOOST_REQUIRE(ss.state() == wsrep::server_state::s_synced);
 }
@@ -644,6 +651,281 @@ BOOST_FIXTURE_TEST_CASE(
     ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
     // Must stay in connected state
     BOOST_REQUIRE(ss.state() == wsrep::server_state::s_connected);
+    // Still the same connection, the provider is told
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 1);
+}
+
+//
+// sst_sent() after the connection on which the donation started has ended
+// is not passed to the provider, and sst_sent() in progress completes
+// before the provider is disconnected, reconnected or unloaded, and before
+// a new donation starts.
+//
+
+namespace
+{
+    // Holds a thread inside a provider call until released.
+    class call_gate
+    {
+    public:
+        call_gate() : mutex_(), cond_(), entered_(), released_() { }
+        void enter_and_wait()
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            entered_ = true;
+            cond_.notify_all();
+            cond_.wait(lock, [this]() { return released_; });
+        }
+        void wait_entered()
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cond_.wait(lock, [this]() { return entered_; });
+        }
+        void release()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+            cond_.notify_all();
+        }
+        bool released()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return released_;
+        }
+    private:
+        std::mutex mutex_;
+        std::condition_variable cond_;
+        bool entered_;
+        bool released_;
+    };
+
+    // Waiting in connect(), unload_provider() and start_sst() is not
+    // observable from outside, give the thread time to reach it. The
+    // assertions hold whether or not it has, the wait only makes the test
+    // exercise the waiting path.
+    void let_thread_reach_wait()
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    void clear_hooks(wsrep::mock_provider& provider)
+    {
+        provider.connect_hook_ = nullptr;
+        provider.disconnect_hook_ = nullptr;
+        provider.sst_sent_hook_ = nullptr;
+        provider.destructor_hook_ = nullptr;
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_sst_sent_after_disconnect,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    ss.disconnect();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnecting);
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 0);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnecting);
+    final_view();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_sst_sent_after_provider_closed,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    // Provider closed the connection by itself
+    final_view();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 0);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_sst_sent_after_reconnect,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    disconnect();
+    connect_in_view(bootstrap_view);
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    // The donation belonged to the previous connection, the state of the
+    // new connection is not touched
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 0);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_connected);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_sst_sent_after_start_sst_while_disconnecting,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.disconnect();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnecting);
+    // State request delivered by the provider before it was closed
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnecting);
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 0);
+    final_view();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_sst_sent_without_provider,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    ss.unload_provider();
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    BOOST_REQUIRE(ss.load_provider("mock", "") == 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_disconnect_waits_for_sst_sent,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    call_gate gate;
+    std::atomic<bool> disconnected_too_early(false);
+    ss.provider().sst_sent_hook_ = [&]() { gate.enter_and_wait(); };
+    ss.provider().disconnect_hook_ = [&]() {
+        if (!gate.released()) disconnected_too_early = true;
+    };
+    std::thread donor([&]() {
+        ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    });
+    gate.wait_entered();
+    std::thread stopper([&]() { ss.disconnect(); });
+    // disconnect() sets the state, then waits for sst_sent() without
+    // releasing the mutex in between
+    while (ss.state() != wsrep::server_state::s_disconnecting)
+    {
+        std::this_thread::yield();
+    }
+    // Give a disconnect() that would not wait the time to reach the
+    // provider before the release
+    let_thread_reach_wait();
+    gate.release();
+    donor.join();
+    stopper.join();
+    clear_hooks(ss.provider());
+    BOOST_REQUIRE(disconnected_too_early == false);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 1);
+    BOOST_REQUIRE(ss.provider().disconnect_calls_ == 1);
+    final_view();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_connect_waits_for_sst_sent,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    call_gate gate;
+    std::atomic<bool> connected_too_early(false);
+    ss.provider().sst_sent_hook_ = [&]() { gate.enter_and_wait(); };
+    ss.provider().connect_hook_ = [&]() {
+        if (!gate.released()) connected_too_early = true;
+    };
+    std::thread donor([&]() {
+        ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    });
+    gate.wait_entered();
+    // Provider closed the connection by itself while sst_sent() is
+    // still inside it
+    final_view();
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_disconnected);
+    std::thread connector([&]() {
+        ss.connect("cluster", "local", "0", false);
+    });
+    let_thread_reach_wait();
+    gate.release();
+    donor.join();
+    connector.join();
+    clear_hooks(ss.provider());
+    BOOST_REQUIRE(connected_too_early == false);
+    BOOST_REQUIRE(ss.provider().connect_calls_ == 2);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_start_sst_waits_for_sst_sent,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    call_gate gate;
+    ss.provider().sst_sent_hook_ = [&]() { gate.enter_and_wait(); };
+    std::thread donor([&]() {
+        ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    });
+    gate.wait_entered();
+    bool const joined_before_release(
+        ss.state() == wsrep::server_state::s_joined);
+    // The provider selects the node as donor again while the previous
+    // sst_sent() is still returning
+    std::thread next_donation([&]() {
+        ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(3)), false);
+    });
+    let_thread_reach_wait();
+    gate.release();
+    donor.join();
+    next_donation.join();
+    clear_hooks(ss.provider());
+    BOOST_REQUIRE(joined_before_release);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    // The end of the new donation is reported
+    ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(3)), 0);
+    BOOST_REQUIRE(ss.provider().sst_sent_calls_ == 2);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_joined);
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    server_state_unload_provider_waits_for_sst_sent,
+    sst_first_server_fixture)
+{
+    bootstrap();
+    ss.start_sst("", wsrep::gtid(cluster_id, wsrep::seqno(2)), false);
+    BOOST_REQUIRE(ss.state() == wsrep::server_state::s_donor);
+    call_gate gate;
+    std::atomic<bool> destroyed(false);
+    std::atomic<bool> used_after_destroy(false);
+    ss.provider().sst_sent_hook_ = [&]() {
+        gate.enter_and_wait();
+        if (destroyed) used_after_destroy = true;
+    };
+    ss.provider().destructor_hook_ = [&]() { destroyed = true; };
+    std::thread donor([&]() {
+        ss.sst_sent(wsrep::gtid(cluster_id, wsrep::seqno(2)), 0);
+    });
+    gate.wait_entered();
+    std::thread unloader([&]() { ss.unload_provider(); });
+    let_thread_reach_wait();
+    BOOST_REQUIRE(destroyed == false);
+    gate.release();
+    donor.join();
+    unloader.join();
+    BOOST_REQUIRE(destroyed == true);
+    BOOST_REQUIRE(used_after_destroy == false);
+    // The unloaded mock provider took its hooks with it
+    BOOST_REQUIRE(ss.load_provider("mock", "") == 0);
 }
 
 /////////////////////////////////////////////////////////////////////////////

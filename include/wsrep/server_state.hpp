@@ -698,6 +698,7 @@ namespace wsrep
             , current_view_()
             , rollback_event_queue_()
             , disable_node_reset_()
+            , sst_donation_(sst_donation_none)
         { }
 
     private:
@@ -741,6 +742,28 @@ namespace wsrep
         // Handle returning from donor state.
         void return_from_donor_state(wsrep::unique_lock<wsrep::mutex>& lock);
 
+        // Mark the end of a provider sst_sent() call.
+        void sst_sent_done(wsrep::unique_lock<wsrep::mutex>& lock);
+
+        // Wait until no sst_sent() call is inside the provider.
+        void wait_sst_sent_done(wsrep::unique_lock<wsrep::mutex>& lock);
+
+        // State of the SST donation of this node. Only one donation runs
+        // at a time: the provider selects the node as donor again only
+        // after its sst_sent() for the previous donation.
+        enum sst_donation_state
+        {
+            // No donation, or its sst_sent() has completed.
+            sst_donation_none,
+            // Donation running on the current connection.
+            sst_donation_active,
+            // sst_sent() of the donation is inside the provider.
+            sst_donation_sending,
+            // The connection ended while the donation was running: its
+            // sst_sent() must not reach the provider.
+            sst_donation_cancelled
+        };
+
         wsrep::mutex& mutex_;
         wsrep::condition_variable& cond_;
         wsrep::server_service& server_service_;
@@ -781,6 +804,7 @@ namespace wsrep
         wsrep::view current_view_;
         std::deque<wsrep::transaction_id> rollback_event_queue_;
         bool disable_node_reset_;
+        enum sst_donation_state sst_donation_;
     };
 
     static inline const char* to_c_string(
